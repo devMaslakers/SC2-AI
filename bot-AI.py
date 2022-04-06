@@ -1,4 +1,5 @@
 from ctypes.wintypes import POINT
+from multiprocessing.connection import wait
 from pickle import TRUE
 from random import random
 from re import A
@@ -22,8 +23,8 @@ gameMap = "ThunderbirdLE"
 
 class stateOfAI_Mind():
     def __init__(self):
-        self.state = [False, False, False, False, False, True]
-        self.stateString = ["stalkerDefend", "defend", "fullDefend", "attack", "fullAttack", "wait"]
+        self.state = [False, False, False, False, False, True, False]
+        self.stateString = ["stalkerDefend", "defend", "fullDefend", "attack", "fullAttack", "wait", "retreat"]
 
         self.pointOfDefence: any 
 
@@ -47,6 +48,10 @@ class stateOfAI_Mind():
 
     async def wait(self):
         await self.setState(5)
+
+    async def retreat(self):
+        await self.setState(6)
+
 
 
     async def setState(self, index):
@@ -76,6 +81,9 @@ class MaslakBot(BotAI):
     maslakCorner_PylonXY = POINT(10, -6)
 
     lastEnemySupply = 0
+
+    nonAttackCounter = 0
+    lastTimeWhenAttacked = 0
     
 
 
@@ -87,6 +95,7 @@ class MaslakBot(BotAI):
             self.maslakCorner = -1
 
         self.mainNexus = self.townhalls.first
+        self.stateOfAI.setPointOfDefence(self.mainNexus)
 
 
 
@@ -97,6 +106,16 @@ class MaslakBot(BotAI):
 
 
     async def on_unit_took_damage(self, unit: Unit, amount_damage_taken: float):
+        async def countSupply(attackedUnit: Unit):
+            closestEnemies = self.enemy_units.in_distance_of_group([attackedUnit], 15)
+            enemySupply = 0
+
+            for enemy in closestEnemies:
+                enemySupply += self.calculate_supply_cost(enemy.type_id)
+            
+            return enemySupply
+
+
         if self.enemy_units:
             isInRange = False
 
@@ -105,13 +124,13 @@ class MaslakBot(BotAI):
                     isInRange = True
 
             if isInRange:
-                closestEnemies = self.enemy_units.in_distance_of_group([unit], 15)
+                self.nonAttackCounter = 0
+                self.lastTimeWhenAttacked = self.state.game_loop
+
                 closestEnemy = self.enemy_units.closest_to(unit)
-                enemySupply = 0
 
-                for enemy in closestEnemies:
-                    enemySupply += self.calculate_supply_cost(enemy.type_id)
-
+                enemySupply = await countSupply(unit)
+        
                 if enemySupply > 0:
                     self.lastEnemySupply = enemySupply
 
@@ -124,6 +143,13 @@ class MaslakBot(BotAI):
                         await self.stateOfAI.setPointOfDefence(closestEnemy)
                         await self.stateOfAI.defend()
                 
+            else:
+                enemySupply = await countSupply(unit)
+                
+                if self.supply_army > enemySupply:
+                    await self.stateOfAI.attack()
+                else:
+                    await self.stateOfAI.retreat()
 
 
 
@@ -157,24 +183,37 @@ class MaslakBot(BotAI):
 
 
     async def maintainMicro(self):
+        state = await self.stateOfAI.getState()
+
+        if self.nonAttackCounter > 100 and self.nonAttackCounter < 120 and self.supply_army > self.lastEnemySupply:
+            self.stateOfAI.attack()
+        else:
+            self.stateOfAI.wait()
+
+
         if self.units.exclude_type({UnitTypeId.PROBE, UnitTypeId.STALKER}).amount > 0:
             army = self.units.exclude_type({UnitTypeId.PROBE, UnitTypeId.STALKER})
-            enemyArmy = self.enemy_units.exclude_type({UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.SCV})
 
-            state = self.stateOfAI.getState()
+            #enemyArmy = self.enemy_units.exclude_type({UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.SCV})
 
-            if state == "attack" or state == "fullAttack" or state == "wait":
+
+            if state == "attack" or state == "fullAttack":
                 targetLocation:any
 
-                if not self.enemy_structures and not self.enemy_units:
-                    targetLocation = self.enemy_start_locations[0]
-                elif not self.enemy_units:
-                    targetLocation = self.enemy_structures.in_closest_distance_to_group(army).position
-                else:
-                    targetLocation = self.enemy_units.in_closest_distance_to_group(army).position
+                if self.lastEnemySupply > self.supply_army:
+                    if not self.enemy_structures and not self.enemy_units:
+                        targetLocation = self.enemy_start_locations[0]
+                    elif not self.enemy_units:
+                        targetLocation = self.enemy_structures.in_closest_distance_to_group(army).position
+                    else:
+                        targetLocation = self.enemy_units.in_closest_distance_to_group(army).position
 
-                for unit in army:
-                    unit.attack(targetLocation)
+                    for unit in army:
+                        unit.attack(targetLocation)
+                else:
+                    self.stateOfAI.retreat()
+
+
 
             elif state == "defend" or state == "fullDefend":
                 for unit in army:
@@ -188,13 +227,26 @@ class MaslakBot(BotAI):
                 for unit in army:
                     unit.move(pos)
 
+            
+            elif state == "retreat":
+                targetArmy = army.in_distance_of_group([self.mainNexus], 30)
+                restOfArmy = army.in_distance_between(self.mainNexus, 30, 300)
+                avgPos = 0
+
+                for defenceUnit in targetArmy:
+                    avgPos += defenceUnit.position
+
+                avgPos = avgPos / targetArmy.amount
+
+                for retreatingUnit in restOfArmy:
+                    retreatingUnit.move(avgPos)
+
 
         if self.units(UnitTypeId.STALKER).amount > 0:
             stalkerGuard = self.units(UnitTypeId.STALKER)
+            #.closest_n_units(self.stateOfAI.pointOfDefence, 4)
 
             if self.townhalls:
-                state = await self.stateOfAI.getState()
-                print(state)
 
                 if state == "stalkerDefend" or state == "defend" or state == "fullDefend" or state == "attack":
                     for stalker in stalkerGuard:
@@ -219,11 +271,13 @@ class MaslakBot(BotAI):
         unit.attack(self.stateOfAI.pointOfDefence)
 
 
+    async def checkNonAttackCounter(self):
+        self.nonAttackCounter = self.state.game_loop - self.lastTimeWhenAttacked
 
 
     async def on_step(self, iteration:int):
         await self.maintainMicro()
-
+        await self.checkNonAttackCounter()
 
 
         async def _trainingProbes():
@@ -317,6 +371,14 @@ class MaslakBot(BotAI):
                     await self.build(UnitTypeId.STARGATE, near=targetPylon)
 
 
+        async def _placingFleetBeacon():
+            if self.already_pending(UnitTypeId.FLEETBEACON) == 0 and self.structures(UnitTypeId.FLEETBEACON).amount == 0:
+                targetNexus = self.structures(UnitTypeId.NEXUS).closest_to(self.start_location)
+                targetPylon = self.structures(UnitTypeId.PYLON).closest_to(targetNexus)
+
+                await self.build(UnitTypeId.FLEETBEACON, targetPylon)
+
+
 
         async def _trainingStalker():
             if self.structures(UnitTypeId.GATEWAY).ready:
@@ -335,6 +397,15 @@ class MaslakBot(BotAI):
                 for stargate in stargates:
                     if self.supply_left >= self.calculate_supply_cost(UnitTypeId.VOIDRAY) and stargate.is_idle:
                         stargate.train(UnitTypeId.VOIDRAY)
+
+        
+        async def _trainingCarrier():
+            if self.structures(UnitTypeId.STARGATE).ready and self.structures(UnitTypeId.FLEETBEACON).ready:
+                stargates = self.structures(UnitTypeId.STARGATE)
+                for stargate in stargates:
+                    if self.supply_left >= self.calculate_supply_cost(UnitTypeId.CARRIER) and stargate.is_idle:
+                        stargate.train(UnitTypeId.CARRIER)
+
 
 
 
@@ -369,6 +440,10 @@ class MaslakBot(BotAI):
             if self.structures(UnitTypeId.CYBERNETICSCORE) and self.structures(UnitTypeId.PYLON) and self.can_afford(UnitTypeId.STARGATE):
                 await _placingStargate()
 
+            #FLEET_BEACON
+            if self.can_afford(UnitTypeId.FLEETBEACON) and self.structures(UnitTypeId.STARGATE).amount >= 2:
+                await _placingFleetBeacon()
+
 
             #SOME_STALKERS
             if self.structures(UnitTypeId.CYBERNETICSCORE).ready and self.can_afford(UnitTypeId.STALKER):
@@ -378,6 +453,10 @@ class MaslakBot(BotAI):
             #VOID_RAY
             if self.structures(UnitTypeId.STARGATE) and self.can_afford(UnitTypeId.VOIDRAY):
                 await _trainingVoidRay()
+
+            #CARRIER
+            if self.structures(UnitTypeId.STARGATE) and self.can_afford(UnitTypeId.CARRIER):
+                await _trainingCarrier()
 
             
 
@@ -405,8 +484,6 @@ class MaslakBot(BotAI):
                     if self.tech_requirement_progress(UpgradeId.PROTOSSAIRARMORSLEVEL3) == 1:
                         self.research(UpgradeId.PROTOSSAIRARMORSLEVEL3)
 
-
-            #FLEET_BEACON
 
         else:
             if self.can_afford(UnitTypeId.NEXUS):
