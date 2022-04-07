@@ -1,9 +1,12 @@
 from ctypes.wintypes import POINT
+import math
 from multiprocessing.connection import wait
 from pickle import TRUE
 from random import random
 from re import A
+from tkinter import UNITS
 from turtle import distance
+from typing import List
 from grpc import protos
 from sc2.bot_ai import BotAI
 from sc2.data import Difficulty, Race, AIBuild
@@ -79,12 +82,16 @@ class MaslakBot(BotAI):
     maslakAmountOfNexuses = 1
     maslakCorner = 1
     maslakCorner_PylonXY = POINT(10, -6)
-
-    lastEnemySupply = 0
+    pointOfWait: any
 
     nonAttackCounter = 0
     lastTimeWhenAttacked = 0
+
+    lastEnemySupply = 0
+    actualEnemySupply = 0
     
+    timeOfEnemyBaseAwait = 0
+    attackNumber = 0
 
 
     async def on_start(self):
@@ -95,7 +102,8 @@ class MaslakBot(BotAI):
             self.maslakCorner = -1
 
         self.mainNexus = self.townhalls.first
-        self.stateOfAI.setPointOfDefence(self.mainNexus)
+        self.pointOfWait = self.main_base_ramp.top_center
+        await self.stateOfAI.setPointOfDefence(self.main_base_ramp.top_center)
 
 
 
@@ -103,6 +111,23 @@ class MaslakBot(BotAI):
         if unit.type_id == UnitTypeId.ASSIMILATOR or unit.type_id == UnitTypeId.NEXUS:
             await self.distribute_workers()
 
+            if unit.type_id == UnitTypeId.NEXUS:
+
+                if self.townhalls.amount == 2:
+                    ramps = self.game_info.map_ramps
+                    closestRamp = self.main_base_ramp
+                    closestRampDistance = 400
+
+                    for ramp in ramps:
+                        if ramp != self.main_base_ramp:
+                            distance = unit.distance_to(ramp.top_center)  
+                            if distance < closestRampDistance:
+
+                                closestRampDistance = distance                   
+                                closestRamp = ramp
+                    pos = closestRamp.top_center.towards(self.start_location, random.randrange(1,2))
+
+                    self.pointOfWait = pos
 
 
     async def on_unit_took_damage(self, unit: Unit, amount_damage_taken: float):
@@ -115,6 +140,10 @@ class MaslakBot(BotAI):
             
             return enemySupply
 
+        if not unit.is_structure:
+            if unit.distance_to(self.enemy_start_locations[0]) < 16:
+                self.timeOfEnemyBaseAwait = 0
+
 
         if self.enemy_units:
             isInRange = False
@@ -123,16 +152,19 @@ class MaslakBot(BotAI):
                 if nexus.distance_to(unit) < 25:
                     isInRange = True
 
+            if not isInRange:
+                if unit.is_structure:
+                    isInRange = True
+
+
             if isInRange:
-                self.nonAttackCounter = 0
-                self.lastTimeWhenAttacked = self.state.game_loop
+                await self.updateNonAttackCounter()
 
                 closestEnemy = self.enemy_units.closest_to(unit)
 
                 enemySupply = await countSupply(unit)
         
                 if enemySupply > 0:
-                    self.lastEnemySupply = enemySupply
 
                     if enemySupply <= 10:
                         await self.stateOfAI.setPointOfDefence(closestEnemy)
@@ -143,25 +175,38 @@ class MaslakBot(BotAI):
                         await self.stateOfAI.setPointOfDefence(closestEnemy)
                         await self.stateOfAI.defend()
                 
-            else:
-                enemySupply = await countSupply(unit)
-                
-                if self.supply_army > enemySupply:
-                    await self.stateOfAI.attack()
-                else:
-                    await self.stateOfAI.retreat()
+
+    async def on_enemy_unit_entered_vision(self, unit: Unit):
+        await self.calculateSupplyInVision()
+
+        self.lastEnemySupply = self.actualEnemySupply
 
 
+    async def on_enemy_unit_left_vision(self, unit_tag: int):
+        await self.calculateSupplyInVision()
 
 
     async def on_unit_destroyed(self, unit_tag: int):
         if unit_tag == UnitTypeId.NEXUS:
             await self.distribute_workers()
+
+        supply = 0
+
+        enemies = self.enemy_units.exclude_type({UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.SCV})
+        for enemy in enemies:
+            supply += self.calculate_supply_cost(enemy.type_id)
+
+        diffrence = self.actualEnemySupply - supply
+
+        if diffrence > 0:
+            self.actualEnemySupply = supply
+            self.lastEnemySupply -= diffrence
         
 
 
 
     async def on_unit_created(self, unit: Unit):
+
         if unit.type_id == UnitTypeId.PROBE:
             probe = unit
             foundIdealNexus = False
@@ -179,110 +224,138 @@ class MaslakBot(BotAI):
 
                 probe.gather(targetMineralField)
 
-
+            
 
 
     async def maintainMicro(self):
+        async def attackCommand():
+            async def searchEnemyCommand():
+                randomNumber = random.randrange(0, ( self.expansion_locations.length ) - 1)
+
+                return randomNumber
+
+
+            targetLocation:any
+
+            if self.supply_army > self.lastEnemySupply:
+
+                if not self.enemy_units and self.enemy_structures:
+                    targetLocation = self.enemy_structures.in_closest_distance_to_group(army).position
+
+                elif self.enemy_units and not self.enemy_structures:
+                    targetLocation = self.enemy_units.in_closest_distance_to_group(army).position
+
+                else:
+                    if self.attackNumber == 0:
+                        targetLocation = self.enemy_start_locations[0]
+                    else:
+                        targetLocation = self.expansion_locations[self.attackNumber]
+
+
+                if army.in_distance_between(self.enemy_start_locations[0], 0, 15):
+                    if self.timeOfEnemyBaseAwait > 400:
+                        self.attackNumber = await searchEnemyCommand()
+
+                if targetLocation:
+                    for unit in army:
+                        unit.attack(targetLocation)
+
+
+            elif self.nonAttackCounter > 100:
+                await self.updateNonAttackCounter()
+                await self.stateOfAI.retreat()
+
+
         state = await self.stateOfAI.getState()
 
-        if self.nonAttackCounter > 100 and self.nonAttackCounter < 120 and self.supply_army > self.lastEnemySupply:
-            self.stateOfAI.attack()
-        else:
-            self.stateOfAI.wait()
 
-
-        if self.units.exclude_type({UnitTypeId.PROBE, UnitTypeId.STALKER}).amount > 0:
-            army = self.units.exclude_type({UnitTypeId.PROBE, UnitTypeId.STALKER})
-
-            #enemyArmy = self.enemy_units.exclude_type({UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.SCV})
+        if self.units.exclude_type({UnitTypeId.PROBE}).amount > 0:
+            army = self.units.exclude_type({UnitTypeId.PROBE})
 
 
             if state == "attack" or state == "fullAttack":
-                targetLocation:any
-
-                if self.lastEnemySupply > self.supply_army:
-                    if not self.enemy_structures and not self.enemy_units:
-                        targetLocation = self.enemy_start_locations[0]
-                    elif not self.enemy_units:
-                        targetLocation = self.enemy_structures.in_closest_distance_to_group(army).position
-                    else:
-                        targetLocation = self.enemy_units.in_closest_distance_to_group(army).position
-
-                    for unit in army:
-                        unit.attack(targetLocation)
-                else:
-                    self.stateOfAI.retreat()
+                await attackCommand()
 
 
-
-            elif state == "defend" or state == "fullDefend":
+            if state == "defend" or state == "fullDefend":
                 for unit in army:
-                    self.defendThePoint(unit)
+                    await self.defendThePoint(unit)
 
 
-            elif state == "wait" or state == "stalkerDefend":
-                targetNexus = self.structures(UnitTypeId.NEXUS).closest_to(self.enemy_start_locations[0])
-                pos = targetNexus.position.towards(self.enemy_start_locations[0], random.randrange(10, 15))
-
+            if state == "wait":
                 for unit in army:
-                    unit.move(pos)
+                    await self.waitAtThePoint(unit)
 
+
+            if state == "stalkerDefend":
+                stalkerArmy = army(UnitTypeId.STALKER)
+
+                for stalker in stalkerArmy:
+                    await self.defendThePoint(stalker)
             
-            elif state == "retreat":
-                targetArmy = army.in_distance_of_group([self.mainNexus], 30)
-                restOfArmy = army.in_distance_between(self.mainNexus, 30, 300)
-                avgPos = 0
 
-                for defenceUnit in targetArmy:
-                    avgPos += defenceUnit.position
+            if state == "retreat":
 
-                avgPos = avgPos / targetArmy.amount
+                targetArmy = army.in_distance_between(self.mainNexus, 30, 300)
 
-                for retreatingUnit in restOfArmy:
-                    retreatingUnit.move(avgPos)
+                if targetArmy.amount != 0:
+            
+                    for retreatingUnit in targetArmy:
+                        targetNexus = self.townhalls.closest_to(self.enemy_start_locations[0])
+                        pos = targetNexus.position.towards(self.enemy_start_locations[0], random.randrange(8,10))
+
+                        retreatingUnit.move(pos)
 
 
-        if self.units(UnitTypeId.STALKER).amount > 0:
-            stalkerGuard = self.units(UnitTypeId.STALKER)
-            #.closest_n_units(self.stateOfAI.pointOfDefence, 4)
-
-            if self.townhalls:
-
-                if state == "stalkerDefend" or state == "defend" or state == "fullDefend" or state == "attack":
-                    for stalker in stalkerGuard:
-                        await self.defendThePoint(stalker)
-
-                elif state == "wait":
-                    targetNexus = self.townhalls.closest_to(self.enemy_start_locations[0])
-                    pos = targetNexus.position.towards(self.enemy_start_locations[0], random.randrange(10, 15))
-
-                    for stalker in stalkerGuard:
-                        stalker.move(pos)
-
+        if self.nonAttackCounter > 100:
+            if self.supply_army >= self.lastEnemySupply and self.supply_army > 30:
+                await self.stateOfAI.attack()
+                await self.updateNonAttackCounter()
+                
             else:
-                targetLocation = self.structures.in_closest_distance_to_group(stalkerGuard).position
+                await self.stateOfAI.wait()
+                await self.updateNonAttackCounter()
 
-                for stalker in stalkerGuard:
-                    stalker.move(pos)
 
+
+    async def calculateSupplyInVision(self):
+        supply = 0
+
+        enemies = self.enemy_units.exclude_type({UnitTypeId.PROBE, UnitTypeId.DRONE, UnitTypeId.SCV})
+        for enemy in enemies:
+            supply += self.calculate_supply_cost(enemy.type_id)
+
+        self.actualEnemySupply = supply
 
         
     async def defendThePoint(self, unit: Unit):
         unit.attack(self.stateOfAI.pointOfDefence)
 
+    async def waitAtThePoint(self, unit: Unit):
+        unit.move(self.pointOfWait)
+
 
     async def checkNonAttackCounter(self):
         self.nonAttackCounter = self.state.game_loop - self.lastTimeWhenAttacked
 
+    async def updateNonAttackCounter(self):
+        self.nonAttackCounter = 0
+        self.lastTimeWhenAttacked = self.state.game_loop
+
+
+    async def checkEnemyWaitingCounter(self):
+        self.timeOfEnemyBaseAwait = self.state.game_loop - self.nonAttackCounter
+
 
     async def on_step(self, iteration:int):
+
         await self.maintainMicro()
         await self.checkNonAttackCounter()
+        await self.checkEnemyWaitingCounter()
 
 
         async def _trainingProbes():
-            if self.supply_left > 0: 
-                nexus.train(UnitTypeId.PROBE)
+            nexus.train(UnitTypeId.PROBE)
 
 
         async def _placingPylon():
@@ -315,10 +388,11 @@ class MaslakBot(BotAI):
 
 
         async def _expanding():
-            if (self.supply_workers / self.structures(UnitTypeId.NEXUS).amount) > 16:
-                    if self.already_pending(UnitTypeId.NEXUS) == 0:
-                        await self.expand_now()
-
+            if self.already_pending(UnitTypeId.NEXUS) == 0:
+                if (self.supply_workers / self.structures(UnitTypeId.NEXUS).amount) > 16:     
+                    await self.expand_now()
+                elif self.supply_cap > 180 and self.minerals > 800:
+                    await self.expand_now()
 
 
         async def _placingAssimilator():
@@ -326,11 +400,12 @@ class MaslakBot(BotAI):
                 geysers = self.vespene_geyser
 
                 for nexus in self.townhalls:
-                    baseGeysers = geysers.closest_n_units(nexus, 2)
+                    if nexus.is_ready:
+                        baseGeysers = geysers.closest_n_units(nexus, 2)
 
-                    for vespeneGeyser in baseGeysers:
-                        if await self.can_place(UnitTypeId.ASSIMILATOR, vespeneGeyser.position):
-                            return vespeneGeyser
+                        for vespeneGeyser in baseGeysers:
+                            if await self.can_place(UnitTypeId.ASSIMILATOR, vespeneGeyser.position):
+                                return vespeneGeyser
 
                 return None
 
@@ -357,10 +432,11 @@ class MaslakBot(BotAI):
 
         async def _placingCyberneticCore():
             if self.structures(UnitTypeId.GATEWAY).ready:
-                if not self.structures(UnitTypeId.CYBERNETICSCORE) and self.already_pending(UnitTypeId.CYBERNETICSCORE) == 0:
+                if self.structures(UnitTypeId.CYBERNETICSCORE).amount < 2 and self.already_pending(UnitTypeId.CYBERNETICSCORE) == 0:
                     targetPylon = self.structures(UnitTypeId.PYLON).closest_to(self.mainNexus)
                     
-                    await self.build(UnitTypeId.CYBERNETICSCORE, near=targetPylon)
+                    if self.structures(UnitTypeId.CYBERNETICSCORE).amount == 0 or self.structures(UnitTypeId.FLEETBEACON):
+                        await self.build(UnitTypeId.CYBERNETICSCORE, near=targetPylon)
 
 
         async def _placingStargate():
@@ -395,7 +471,7 @@ class MaslakBot(BotAI):
             if self.structures(UnitTypeId.STARGATE).ready:
                 stargates = self.structures(UnitTypeId.STARGATE)
                 for stargate in stargates:
-                    if self.supply_left >= self.calculate_supply_cost(UnitTypeId.VOIDRAY) and stargate.is_idle:
+                    if stargate.is_idle and self.can_afford(UnitTypeId.VOIDRAY):
                         stargate.train(UnitTypeId.VOIDRAY)
 
         
@@ -403,7 +479,7 @@ class MaslakBot(BotAI):
             if self.structures(UnitTypeId.STARGATE).ready and self.structures(UnitTypeId.FLEETBEACON).ready:
                 stargates = self.structures(UnitTypeId.STARGATE)
                 for stargate in stargates:
-                    if self.supply_left >= self.calculate_supply_cost(UnitTypeId.CARRIER) and stargate.is_idle:
+                    if stargate.is_idle and self.can_afford(UnitTypeId.CARRIER):
                         stargate.train(UnitTypeId.CARRIER)
 
 
@@ -435,54 +511,56 @@ class MaslakBot(BotAI):
             #CYBERNETIC_CORE
             if self.structures(UnitTypeId.GATEWAY) and self.structures(UnitTypeId.PYLON) and self.can_afford(UnitTypeId.CYBERNETICSCORE):
                 await _placingCyberneticCore()
-            
-            #STARGATE
-            if self.structures(UnitTypeId.CYBERNETICSCORE) and self.structures(UnitTypeId.PYLON) and self.can_afford(UnitTypeId.STARGATE):
-                await _placingStargate()
 
             #FLEET_BEACON
             if self.can_afford(UnitTypeId.FLEETBEACON) and self.structures(UnitTypeId.STARGATE).amount >= 2:
                 await _placingFleetBeacon()
 
 
-            #SOME_STALKERS
-            if self.structures(UnitTypeId.CYBERNETICSCORE).ready and self.can_afford(UnitTypeId.STALKER):
-                await _trainingStalker()
-
-
-            #VOID_RAY
-            if self.structures(UnitTypeId.STARGATE) and self.can_afford(UnitTypeId.VOIDRAY):
-                await _trainingVoidRay()
-
             #CARRIER
             if self.structures(UnitTypeId.STARGATE) and self.can_afford(UnitTypeId.CARRIER):
                 await _trainingCarrier()
-
             
+            #VOID_RAY
+            elif self.structures(UnitTypeId.STARGATE) and self.can_afford(UnitTypeId.VOIDRAY):
+                await _trainingVoidRay()
+            
+            #STARGATE
+            elif self.structures(UnitTypeId.CYBERNETICSCORE) and self.structures(UnitTypeId.PYLON) and self.can_afford(UnitTypeId.STARGATE):
+                await _placingStargate()
+
+            #SOME_STALKERS
+            elif self.structures(UnitTypeId.CYBERNETICSCORE).ready and self.can_afford(UnitTypeId.STALKER):
+                await _trainingStalker()
+
+                     
 
             #UPGRADES
             if self.structures(UnitTypeId.CYBERNETICSCORE).ready:
-                if self.can_afford(UpgradeId.PROTOSSAIRWEAPONSLEVEL1) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL1) == 0:
-                    self.research(UpgradeId.PROTOSSAIRWEAPONSLEVEL1)
+                for cyberneticsCore in self.structures(UnitTypeId.CYBERNETICSCORE):
+                    if not cyberneticsCore.is_idle:
+                        if self.can_afford(UpgradeId.PROTOSSAIRWEAPONSLEVEL1) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL1) == 0:
+                            self.research(UpgradeId.PROTOSSAIRWEAPONSLEVEL1)
 
-                elif self.can_afford(UpgradeId.PROTOSSAIRARMORSLEVEL1) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRARMORSLEVEL1) == 0:
-                    self.research(UpgradeId.PROTOSSAIRARMORSLEVEL1)
+                        elif self.can_afford(UpgradeId.PROTOSSAIRWEAPONSLEVEL2) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL2) == 0:
+                            if self.tech_requirement_progress(UpgradeId.PROTOSSAIRWEAPONSLEVEL2) == 1:
+                                self.research(UpgradeId.PROTOSSAIRWEAPONSLEVEL2)
 
-                elif self.can_afford(UpgradeId.PROTOSSAIRWEAPONSLEVEL2) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL2) == 0:
-                    if self.tech_requirement_progress(UpgradeId.PROTOSSAIRWEAPONSLEVEL2) == 1:
-                        self.research(UpgradeId.PROTOSSAIRWEAPONSLEVEL2)
+                        elif self.can_afford(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) == 0:
+                            if self.tech_requirement_progress(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) == 1:
+                                self.research(UpgradeId.PROTOSSAIRWEAPONSLEVEL3)
 
-                elif self.can_afford(UpgradeId.PROTOSSAIRARMORSLEVEL2) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRARMORSLEVEL2) == 0:
-                    if self.tech_requirement_progress(UpgradeId.PROTOSSAIRARMORSLEVEL2) == 1:
-                        self.research(UpgradeId.PROTOSSAIRARMORSLEVEL2)
 
-                elif self.can_afford(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) == 0:
-                    if self.tech_requirement_progress(UpgradeId.PROTOSSAIRWEAPONSLEVEL3) == 1:
-                        self.research(UpgradeId.PROTOSSAIRWEAPONSLEVEL3)
+                        if self.can_afford(UpgradeId.PROTOSSAIRARMORSLEVEL1) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRARMORSLEVEL1) == 0:
+                            self.research(UpgradeId.PROTOSSAIRARMORSLEVEL1)
 
-                elif self.can_afford(UpgradeId.PROTOSSAIRARMORSLEVEL3) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRARMORSLEVEL3) == 0:
-                    if self.tech_requirement_progress(UpgradeId.PROTOSSAIRARMORSLEVEL3) == 1:
-                        self.research(UpgradeId.PROTOSSAIRARMORSLEVEL3)
+                        elif self.can_afford(UpgradeId.PROTOSSAIRARMORSLEVEL2) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRARMORSLEVEL2) == 0:
+                            if self.tech_requirement_progress(UpgradeId.PROTOSSAIRARMORSLEVEL2) == 1:
+                                self.research(UpgradeId.PROTOSSAIRARMORSLEVEL2)
+
+                        elif self.can_afford(UpgradeId.PROTOSSAIRARMORSLEVEL3) and self.already_pending_upgrade(UpgradeId.PROTOSSAIRARMORSLEVEL3) == 0:
+                            if self.tech_requirement_progress(UpgradeId.PROTOSSAIRARMORSLEVEL3) == 1:
+                                self.research(UpgradeId.PROTOSSAIRARMORSLEVEL3)
 
 
         else:
