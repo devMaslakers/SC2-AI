@@ -582,7 +582,16 @@ class MaslakBot(BotAI):
                 await self.expand_now()
 
 
-        
+ #If you want to play against it:       
+run_game(
+    maps.get(gameMap),
+    [Human(Race.Protoss),
+     Bot(Race.Protoss, MaslakBot(), name="Maslakos")
+    ],     
+     realtime=False
+)
+
+
 
 run_game(
     maps.get(gameMap),
