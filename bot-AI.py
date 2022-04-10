@@ -82,7 +82,9 @@ class MaslakBot(BotAI):
     maslakAmountOfNexuses = 1
     maslakCorner = 1
     maslakCorner_PylonXY = POINT(10, -6)
+
     pointOfWait: any
+    listOfEnemyPossibleBases = []
 
     nonAttackCounter = 0
     lastTimeWhenAttacked = 0
@@ -91,13 +93,14 @@ class MaslakBot(BotAI):
     actualEnemySupply = 0
     
     timeOfEnemyBaseAwait = 0
+    awaitTimeCounter = 0
     attackNumber = 0
 
 
     async def on_start(self):
 
         if self.townhalls.first.position[0] < self.townhalls.first.position[1]:
-                self.maslakCorner = 1
+            self.maslakCorner = 1
         else:
             self.maslakCorner = -1
 
@@ -105,6 +108,11 @@ class MaslakBot(BotAI):
         self.pointOfWait = self.main_base_ramp.top_center
         await self.stateOfAI.setPointOfDefence(self.main_base_ramp.top_center)
 
+        for expansion in self.expansion_locations_list:
+            if self.mainNexus.distance_to(expansion) > 100:
+                self.listOfEnemyPossibleBases.append(expansion)
+         
+        print(self.listOfEnemyPossibleBases)
 
 
     async def on_building_construction_complete(self, unit: Unit):
@@ -141,8 +149,8 @@ class MaslakBot(BotAI):
             return enemySupply
 
         if not unit.is_structure:
-            if unit.distance_to(self.enemy_start_locations[0]) < 16:
-                self.timeOfEnemyBaseAwait = 0
+            if unit.distance_to(self.listOfEnemyPossibleBases[self.attackNumber]) < 16:
+                self.awaitTimeCounter = self.state.game_loop
 
 
         if self.enemy_units:
@@ -230,7 +238,9 @@ class MaslakBot(BotAI):
     async def maintainMicro(self):
         async def attackCommand():
             async def searchEnemyCommand():
-                randomNumber = random.randrange(0, ( self.expansion_locations.length ) - 1)
+                length = len(self.listOfEnemyPossibleBases)
+
+                randomNumber = random.randrange(0, length - 1)
 
                 return randomNumber
 
@@ -249,12 +259,16 @@ class MaslakBot(BotAI):
                     if self.attackNumber == 0:
                         targetLocation = self.enemy_start_locations[0]
                     else:
-                        targetLocation = self.expansion_locations[self.attackNumber]
+                        targetLocation = self.listOfEnemyPossibleBases[self.attackNumber]
 
 
                 if army.in_distance_between(self.enemy_start_locations[0], 0, 15):
-                    if self.timeOfEnemyBaseAwait > 400:
+                    await self.checkEnemyWaitingCounter()
+
+                    if self.timeOfEnemyBaseAwait > 800:
+                        self.awaitTimeCounter = self.state.game_loop
                         self.attackNumber = await searchEnemyCommand()
+
 
                 if targetLocation:
                     for unit in army:
@@ -344,14 +358,14 @@ class MaslakBot(BotAI):
 
 
     async def checkEnemyWaitingCounter(self):
-        self.timeOfEnemyBaseAwait = self.state.game_loop - self.nonAttackCounter
+        self.timeOfEnemyBaseAwait = self.state.game_loop - self.awaitTimeCounter
 
 
     async def on_step(self, iteration:int):
+        print( iteration, self.timeOfEnemyBaseAwait )
 
         await self.maintainMicro()
         await self.checkNonAttackCounter()
-        await self.checkEnemyWaitingCounter()
 
 
         async def _trainingProbes():
